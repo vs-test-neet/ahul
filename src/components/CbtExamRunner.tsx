@@ -42,7 +42,7 @@ import {
   parseCbtHtmlFile,
 } from '../utils/htmlTestParser';
 import { generateQuestionPaperPdfWithWatermark } from '../utils/questionPaperPdfGenerator';
-import { loadTestBundleFromFirestore } from '../firebase';
+import { isUsingStaticStore, loadTestBundleFromFirestore } from '../firebase';
 import { HeartCelebrationCanvas } from './HeartCelebrationCanvas';
 
 interface CbtExamRunnerProps {
@@ -1803,13 +1803,17 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     );
   };
 
-  // Primary zero-RAM streaming URL when server hosts the test HTML cleanly (eliminates 12MB+ Blob/state duplication)
+  // Primary zero-RAM streaming URL when server or Vercel static CDN hosts the test HTML cleanly
   const serverHtmlPaperUrl = useMemo(() => {
     if (!exactHtmlMode || isSubmitted || !useServerHtmlStream || serverStreamFailed || activeRawHtml.trim().length > 20) {
       return '';
     }
     if (!testMeta.id) return '';
-    return `/api/store/test/${encodeURIComponent(testMeta.id)}/paper.html?v=${serverStreamMountNonce}`;
+    const safeId = testMeta.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
+    if (isUsingStaticStore()) {
+      return `/static-store/paper/${encodeURIComponent(safeId)}.html?v=${serverStreamMountNonce}`;
+    }
+    return `/api/store/test/${encodeURIComponent(safeId)}/paper.html?v=${serverStreamMountNonce}`;
   }, [exactHtmlMode, isSubmitted, useServerHtmlStream, serverStreamFailed, activeRawHtml, testMeta.id, serverStreamMountNonce]);
 
   const triggerLocalHtmlFallback = useCallback(async () => {
@@ -2696,6 +2700,7 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
         <iframe
           src={activeIframeSrc}
           srcDoc={activeIframeSrcDoc}
+          onLoad={() => setHtmlBridgeReady(true)}
           onError={() => {
             if (serverHtmlPaperUrl) {
               void triggerLocalHtmlFallback();

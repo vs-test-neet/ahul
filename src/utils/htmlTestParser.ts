@@ -16,6 +16,7 @@ export function ensureImageDataUrl(str: string): string {
   const s = String(str || '').trim();
   if (!s) return '';
   if (s.startsWith('data:image/')) return s;
+  if (s.startsWith('/api/') || s.startsWith('/assets/') || s.startsWith('/static-store/')) return s;
   if (/^https?:\/\/.+\.(png|jpe?g|webp|gif|svg)(\?.*)?$/i.test(s)) return s;
   const compact = s.replace(/\s+/g, '');
   if (compact.startsWith('iVBORw0KGgo')) return `data:image/png;base64,${compact}`;

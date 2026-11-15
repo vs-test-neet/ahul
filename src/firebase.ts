@@ -80,6 +80,11 @@ export async function signOutUser() {
 }
 
 let lastKnownServerVersion = 0;
+let isStaticStoreHost = false;
+
+export function isUsingStaticStore(): boolean {
+  return isStaticStoreHost;
+}
 
 const sessionDeletedTestIds = new Set<string>();
 
@@ -112,8 +117,8 @@ export function markTestDeletedLocally(testId: string) {
 }
 
 /**
- * Bootstrap all portal state (tests, folders, students, attempts, notifications) from the Express RAM/Disk store `/api/store/bootstrap`.
- * Supports `sinceVersion` so 10,000 concurrent students receive a 28-byte `{ unchanged: true }` response when nothing changed!
+ * Bootstrap all portal state (tests, folders, students, attempts, notifications) from the Express RAM/Disk store `/api/store/bootstrap`
+ * or automatically fall back to `/static-store/bootstrap.json` on Vercel / static CDN deployments!
  */
 export async function fetchPortalBootstrap(forceFull = false): Promise<{
   unchanged?: boolean;
@@ -133,15 +138,36 @@ export async function fetchPortalBootstrap(forceFull = false): Promise<{
 } | null> {
   try {
     const versionParam = !forceFull && lastKnownServerVersion > 0 ? `&sinceVersion=${lastKnownServerVersion}` : '';
-    const res = await fetch(`/api/store/bootstrap?t=${Date.now()}${versionParam}`, {
-      cache: 'no-store',
-      headers: {
-        'Cache-Control': 'no-cache',
-        Pragma: 'no-cache',
-      },
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
+    let data: Record<string, any> | null = null;
+
+    if (!isStaticStoreHost) {
+      try {
+        const res = await fetch(`/api/store/bootstrap?t=${Date.now()}${versionParam}`, {
+          cache: 'no-store',
+          headers: {
+            'Cache-Control': 'no-cache',
+            Pragma: 'no-cache',
+          },
+        });
+        const ct = (res.headers.get('content-type') || '').toLowerCase();
+        if (res.ok && ct.includes('json')) {
+          data = await res.json();
+        } else {
+          isStaticStoreHost = true;
+        }
+      } catch {
+        isStaticStoreHost = true;
+      }
+    }
+
+    if (!data) {
+      const staticRes = await fetch(`/static-store/bootstrap.json?t=${Date.now()}`, {
+        cache: 'no-store',
+      });
+      if (!staticRes.ok) return null;
+      data = await staticRes.json();
+      isStaticStoreHost = true;
+    }
     if (data && data.unchanged) {
       return {
         unchanged: true,
@@ -1259,19 +1285,30 @@ export async function loadTestBundleFromFirestore(
     return { questions: vaultQs, rawHtml: vaultHtml };
   }
 
-  // 3. Single Network Fetch from Express Server Store (`/api/store/test/:id`)
+  // 3. Single Network Fetch from Express Server Store (`/api/store/test/:id`) or Vercel Static Store (`/static-store/test/:id.json`)
   let serverQs: CbtQuestion[] = [];
   let serverHtml = '';
   let serverMeta: CbtTestMeta | undefined;
   try {
     const controller = new AbortController();
     const timer = window.setTimeout(() => controller.abort(), 45000);
-    const res = await fetch(`/api/store/test/${encodeURIComponent(safeId)}`, {
+    const primaryUrl = isStaticStoreHost
+      ? `/static-store/test/${encodeURIComponent(safeId)}.json`
+      : `/api/store/test/${encodeURIComponent(safeId)}`;
+    let res = await fetch(primaryUrl, {
       cache: 'no-store',
       signal: controller.signal,
     });
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if ((!res.ok || !ct.includes('json')) && !isStaticStoreHost) {
+      isStaticStoreHost = true;
+      res = await fetch(`/static-store/test/${encodeURIComponent(safeId)}.json`, {
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+    }
     window.clearTimeout(timer);
-    if (res.ok) {
+    if (res.ok && (res.headers.get('content-type') || '').toLowerCase().includes('json')) {
       const payload = await res.json();
       if (payload.meta && payload.meta.id) {
         serverMeta = payload.meta as CbtTestMeta;
@@ -1283,6 +1320,19 @@ export async function loadTestBundleFromFirestore(
         serverQs = payload.questions.map((item: unknown, idx: number) =>
           normalizeCbtQuestion(item, idx)
         );
+      }
+      if (!serverHtml && isStaticStoreHost) {
+        try {
+          const paperRes = await fetch(`/static-store/paper/${encodeURIComponent(safeId)}.html`);
+          if (paperRes.ok) {
+            const htmlText = await paperRes.text();
+            if (htmlText && !htmlText.includes('<div id="root"></div>')) {
+              serverHtml = htmlText;
+            }
+          }
+        } catch {
+          // ignore
+        }
       }
       if (serverHtml.trim().length > 100 && serverQs.length === 0) {
         const parsedFromHtml = parseCbtHtmlFile(serverHtml, serverMeta?.title || safeId);
@@ -1341,7 +1391,7 @@ export async function loadTestHtmlFromFirestore(testId: string): Promise<string>
 /**
  * Ultra-lightweight (<300KB) launch loader for HTML test mode:
  * Streams the full multi-MB HTML paper directly inside the sandboxed <iframe> via `/api/store/test/:id/paper.html`
- * instead of cloning 12.6MB strings across fetch JSON, React state, IndexedDB, and Blob URLs (preventing mobile OOM crashes!).
+ * or `/static-store/paper/:id.html` on Vercel.
  * Falls back cleanly to local IndexedDB Vault / localStorage when offline.
  */
 export async function loadTestFastForLaunch(
@@ -1349,29 +1399,27 @@ export async function loadTestFastForLaunch(
 ): Promise<{ questions: CbtQuestion[]; rawHtml: string; useServerHtmlStream: boolean }> {
   const safeId = testId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
 
-  // 1. If already cached in RAM, reuse immediately
-  const cachedRam = ramTestBundleCache.get(safeId);
-  if (
-    cachedRam &&
-    (cachedRam.rawHtml.trim().length > 20 || areQuestionsPlayable(cachedRam.questions))
-  ) {
-    return {
-      questions: cachedRam.questions,
-      rawHtml: cachedRam.rawHtml,
-      useServerHtmlStream: false,
-    };
-  }
-
-  // 2. Fast metadata+questions query (?skipHtml=1) to verify server availability without downloading 12MB+ rawHtml JSON
+  // 1. Fast metadata+questions query (?skipHtml=1 or /static-store/test/:id.json is <100KB for ALL tests!)
   try {
     const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), 15000);
-    const res = await fetch(`/api/store/test/${encodeURIComponent(safeId)}?skipHtml=1`, {
+    const timer = window.setTimeout(() => controller.abort(), 8000);
+    const primaryUrl = isStaticStoreHost
+      ? `/static-store/test/${encodeURIComponent(safeId)}.json`
+      : `/api/store/test/${encodeURIComponent(safeId)}?skipHtml=1`;
+    let res = await fetch(primaryUrl, {
       cache: 'no-store',
       signal: controller.signal,
     });
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if ((!res.ok || !ct.includes('json')) && !isStaticStoreHost) {
+      isStaticStoreHost = true;
+      res = await fetch(`/static-store/test/${encodeURIComponent(safeId)}.json`, {
+        cache: 'no-store',
+        signal: controller.signal,
+      });
+    }
     window.clearTimeout(timer);
-    if (res.ok) {
+    if (res.ok && (res.headers.get('content-type') || '').toLowerCase().includes('json')) {
       const payload = (await res.json()) as {
         hasRawHtml?: boolean;
         questions?: unknown[];
@@ -1388,15 +1436,43 @@ export async function loadTestFastForLaunch(
       }
     }
   } catch {
-    // Offline or network glitch -> fall through to IndexedDB Vault
+    // Offline or network glitch -> check local RAM/IndexedDB Vault only (never block on a 12MB network fetch!)
   }
 
-  // 3. Offline / local-only fallback via full bundle loader
-  const fallbackBundle = await loadTestBundleFromFirestore(testId);
+  // 2. Check RAM cache (0ms)
+  const cachedRam = ramTestBundleCache.get(safeId);
+  if (
+    cachedRam &&
+    (cachedRam.rawHtml.trim().length > 20 || areQuestionsPlayable(cachedRam.questions))
+  ) {
+    return {
+      questions: cachedRam.questions,
+      rawHtml: cachedRam.rawHtml,
+      useServerHtmlStream: !cachedRam.rawHtml,
+    };
+  }
+
+  // 3. Offline local-only check via IndexedDB Vault (<5ms, zero network hang)
+  try {
+    const [vaultQs, vaultHtml] = await Promise.all([
+      getVaultTestQuestions(safeId),
+      getVaultTestHtml(safeId),
+    ]);
+    if (vaultHtml.trim().length > 20 || vaultQs.length > 0) {
+      return {
+        questions: vaultQs,
+        rawHtml: vaultHtml,
+        useServerHtmlStream: !vaultHtml,
+      };
+    }
+  } catch {
+    // ignore
+  }
+
   return {
-    questions: fallbackBundle.questions,
-    rawHtml: fallbackBundle.rawHtml,
-    useServerHtmlStream: false,
+    questions: [],
+    rawHtml: '',
+    useServerHtmlStream: true,
   };
 }
 

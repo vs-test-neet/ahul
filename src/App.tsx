@@ -2452,7 +2452,7 @@ function AppContent() {
     }));
   };
 
-  // Load questions for any test (from Memory Cache -> IndexedDB Vault -> Server Store)
+  // Load questions for any test (uses <25KB fast endpoint with /qimg URLs first so mobile never downloads 10MB JSON)
   const loadQuestionsForTest = async (test: CbtTestMeta): Promise<CbtQuestion[]> => {
     if (localQuestionsCache[test.id] && localQuestionsCache[test.id].length > 0) {
       return localQuestionsCache[test.id].map((q, idx) => normalizeCbtQuestion(q, idx));
@@ -2465,10 +2465,12 @@ function AppContent() {
       }
     }
     try {
-      const bundle = await loadTestBundleFromFirestore(test.id);
-      if (bundle.rawHtml) {
-        setLocalRawHtmlCache((prev) => ({ ...prev, [test.id]: bundle.rawHtml }));
+      const fast = await loadTestFastForLaunch(test.id);
+      if (fast.questions.length > 0) {
+        setLocalQuestionsCache((prev) => ({ ...prev, [test.id]: fast.questions }));
+        return fast.questions;
       }
+      const bundle = await loadTestBundleFromFirestore(test.id);
       if (bundle.questions.length > 0) {
         setLocalQuestionsCache((prev) => ({ ...prev, [test.id]: bundle.questions }));
         return bundle.questions;
@@ -2479,9 +2481,6 @@ function AppContent() {
           setLocalQuestionsCache((prev) => ({ ...prev, [test.id]: parsedFromHtml.questions }));
           return parsedFromHtml.questions;
         }
-        const slots = createCleanCompanionSlots(test);
-        setLocalQuestionsCache((prev) => ({ ...prev, [test.id]: slots }));
-        return slots;
       }
     } catch {
       // ignore
@@ -2556,96 +2555,104 @@ function AppContent() {
     }
   }, []);
 
-  // Increment playCount and launch the Exam Runner via zero-RAM direct HTML stream (or Practice Mode)
+  // Increment playCount and launch the Exam Runner INSTANTLY in 0ms via zero-RAM direct HTML stream (or Practice Mode)
   const handleStartExamNow = async (
     test: CbtTestMeta,
     modeOverride?: 'html' | 'practice'
   ) => {
-    if (isLoadingTestQuestions) return;
     if (test.scheduledAt && test.scheduledAt > Date.now() && !isAdminUnlocked) {
       showToast('⏰ This test is still scheduled and locked until its start time.', 'error');
       return;
     }
+
+    const launchMode = modeOverride || selectedExamLaunchMode;
+    const preferHtml = launchMode !== 'practice';
+
+    let qs = localQuestionsCache[test.id] || [];
+    const hasPlayableCachedQs =
+      qs.length > 0 &&
+      Boolean(
+        qs[0]?.imageEn ||
+          qs[0]?.imageHi ||
+          qs[0]?.imageUrl ||
+          (Array.isArray(qs[0]?.imageUrls) && qs[0].imageUrls.length > 0) ||
+          (String(qs[0]?.questionEn || qs[0]?.questionHi || '').trim().length >= 22 &&
+            !/^(biology|physics|chemistry|botany|zoology)$/i.test(
+              String(qs[0]?.questionEn || qs[0]?.questionHi || '').trim()
+            ))
+      );
+
+    // INSTANT 0ms LAUNCH PATH for all HTML tests — never block on 'Opening Test Paper...' modal!
+    if (preferHtml) {
+      const initialQs = qs.length > 0 ? qs : createCleanCompanionSlots(test);
+      setLocalRawHtmlCache({});
+      setLocalQuestionsCache({ ...BUILT_IN_COMPANION_QUESTIONS, [test.id]: initialQs });
+      setTests((prev) =>
+        prev.map((t) => (t.id === test.id ? { ...t, playCount: (t.playCount || 0) + 1 } : t))
+      );
+      incrementTestEngagement(test.id, 'playCount').catch(() => {});
+      setSelectedTestForInstructions(null);
+      setIsLoadingTestQuestions(false);
+      setActiveRunningTest({
+        meta: test,
+        questions: initialQs,
+        practiceMode: false,
+        rawHtmlContent: '',
+        initialHtmlMode: true,
+        useServerHtmlStream: true,
+        reviewAttempt: null,
+      });
+
+      // Hydrate compact answer keys & /qimg URLs silently in the background without blocking UI
+      if (!hasPlayableCachedQs && test.id !== 'prayas_06') {
+        void loadTestFastForLaunch(test.id)
+          .then((fastLaunch) => {
+            if (fastLaunch.questions.length > 0) {
+              setLocalQuestionsCache((prev) => ({
+                ...prev,
+                [test.id]: fastLaunch.questions,
+              }));
+              setActiveRunningTest((prev) =>
+                prev && prev.meta.id === test.id
+                  ? { ...prev, questions: fastLaunch.questions }
+                  : prev
+              );
+            }
+          })
+          .catch(() => {});
+      }
+      return;
+    }
+
+    if (isLoadingTestQuestions) return;
     setIsLoadingTestQuestions(true);
     try {
-      const launchMode = modeOverride || selectedExamLaunchMode;
-      const preferHtml = launchMode !== 'practice';
-
-      let rawHtml = '';
-      let useServerHtmlStream = false;
-      let qs = localQuestionsCache[test.id] || [];
-      const hasPlayableCachedQs =
-        qs.length > 0 &&
-        Boolean(
-          qs[0]?.imageEn ||
-            qs[0]?.imageHi ||
-            qs[0]?.imageUrl ||
-            (Array.isArray(qs[0]?.imageUrls) && qs[0].imageUrls.length > 0) ||
-            (String(qs[0]?.questionEn || qs[0]?.questionHi || '').trim().length >= 22 &&
-              !/^(biology|physics|chemistry|botany|zoology)$/i.test(
-                String(qs[0]?.questionEn || qs[0]?.questionHi || '').trim()
-              ))
-        );
-
-      if (preferHtml) {
-        if (test.id === 'prayas_06' || (test.assetUrl && test.assetUrl.startsWith('/assets/'))) {
-          useServerHtmlStream = true;
-          if (!qs.length) {
-            qs = createCleanCompanionSlots(test);
-          }
-        } else if (localRawHtmlCache[test.id]) {
-          rawHtml = localRawHtmlCache[test.id];
-          if (!hasPlayableCachedQs && rawHtml) {
-            const parsed = parseCbtHtmlFile(rawHtml, test.title);
-            if (parsed && Array.isArray(parsed.questions) && parsed.questions.length > 0) {
-              qs = parsed.questions;
-            }
-          }
-        } else {
-          // Zero-RAM fast launch: checks metadata without downloading 12MB+ HTML blob into parent React tab
-          const fastLaunch = await loadTestFastForLaunch(test.id);
-          useServerHtmlStream = fastLaunch.useServerHtmlStream;
-          if (!useServerHtmlStream && fastLaunch.rawHtml) {
-            rawHtml = fastLaunch.rawHtml;
-          }
-          if (fastLaunch.questions.length > 0) {
-            qs = fastLaunch.questions;
-          }
+      let rawHtml = localRawHtmlCache[test.id] || '';
+      if (test.id === 'prayas_06' || test.assetUrl) {
+        if (!hasPlayableCachedQs) {
+          qs = await loadBuiltInPrayas06Questions();
         }
-      } else {
-        rawHtml = localRawHtmlCache[test.id] || '';
-        if (test.id === 'prayas_06' || test.assetUrl) {
-          if (!rawHtml || !hasPlayableCachedQs) {
-            const [bHtml, bQs] = await Promise.all([
-              rawHtml ? Promise.resolve(rawHtml) : loadBuiltInPrayas06Html(),
-              hasPlayableCachedQs ? Promise.resolve(qs) : loadBuiltInPrayas06Questions(),
-            ]);
-            rawHtml = bHtml;
-            qs = bQs;
-          }
-        } else if (!hasPlayableCachedQs) {
+      } else if (!hasPlayableCachedQs) {
+        const fast = await loadTestFastForLaunch(test.id);
+        if (fast.questions.length > 0) {
+          qs = fast.questions;
+        } else {
           const bundle = await loadTestBundleFromFirestore(test.id);
           if (bundle.rawHtml) rawHtml = bundle.rawHtml;
           if (bundle.questions.length > 0) qs = bundle.questions;
         }
-        if (qs.length === 0 && rawHtml) {
-          const parsed = parseCbtHtmlFile(rawHtml, test.title);
-          if (parsed && Array.isArray(parsed.questions) && parsed.questions.length > 0) {
-            qs = parsed.questions;
-          }
+      }
+      if (qs.length === 0 && rawHtml) {
+        const parsed = parseCbtHtmlFile(rawHtml, test.title);
+        if (parsed && Array.isArray(parsed.questions) && parsed.questions.length > 0) {
+          qs = parsed.questions;
         }
       }
-
       if (qs.length === 0) {
         qs = createCleanCompanionSlots(test);
       }
 
-      // Never keep multiple multi-MB question arrays or HTML blobs pinned in React state on mobile
-      if (!useServerHtmlStream && rawHtml) {
-        setLocalRawHtmlCache({ [test.id]: rawHtml });
-      } else {
-        setLocalRawHtmlCache({});
-      }
+      setLocalRawHtmlCache({});
       setLocalQuestionsCache({ ...BUILT_IN_COMPANION_QUESTIONS, [test.id]: qs });
 
       setTests((prev) =>
@@ -2657,10 +2664,10 @@ function AppContent() {
       setActiveRunningTest({
         meta: test,
         questions: qs,
-        practiceMode: launchMode === 'practice',
-        rawHtmlContent: rawHtml,
-        initialHtmlMode: preferHtml,
-        useServerHtmlStream,
+        practiceMode: true,
+        rawHtmlContent: '',
+        initialHtmlMode: false,
+        useServerHtmlStream: false,
         reviewAttempt: null,
       });
     } catch {
@@ -2672,8 +2679,6 @@ function AppContent() {
 
   // Open any test card or PDF immediately (checking scheduled unlock time for students)
   const handleStudentOpenTestCard = async (test: CbtTestMeta) => {
-    if (isLoadingTestQuestions) return;
-
     if (test.isPdfOnly) {
       const matchedFolder = folders.find((f) => f.id === test.folderId);
       const pdfId =
@@ -2762,17 +2767,13 @@ function AppContent() {
       };
 
     setIsLoadingTestQuestions(true);
-    showToast('Opening detailed Test Analysis & Solutions...', 'info');
     try {
-      const [qs, rawHtml] = await Promise.all([
-        loadQuestionsForTest(matchedTest),
-        loadRawHtmlForTest(matchedTest).catch(() => ''),
-      ]);
+      const qs = await loadQuestionsForTest(matchedTest);
       setSelectedTestForInstructions(null);
       setActiveRunningTest({
         meta: matchedTest,
         questions: qs,
-        rawHtmlContent: rawHtml,
+        rawHtmlContent: '',
         practiceMode: false,
         reviewAttempt: attempt,
       });
@@ -3508,6 +3509,13 @@ function AppContent() {
             <p className="text-xs font-semibold text-slate-600 dark:text-slate-400">
               Preparing full bilingual CBT paper &amp; diagrams
             </p>
+            <button
+              type="button"
+              onClick={() => setIsLoadingTestQuestions(false)}
+              className="mt-1 px-4 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-extrabold transition"
+            >
+              ✕ Cancel
+            </button>
           </div>
         </div>
       )}

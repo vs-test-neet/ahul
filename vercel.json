@@ -1,0 +1,30 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "rewrites": [
+    {
+      "source": "/api/store/bootstrap",
+      "destination": "/static-store/bootstrap.json"
+    },
+    {
+      "source": "/api/store/test/:testId/paper.html",
+      "destination": "/static-store/paper/:testId.html"
+    },
+    {
+      "source": "/api/store/test/:testId/qimg/:qIdx/:lang",
+      "destination": "/static-store/qimg/:testId/:qIdx_:lang.png"
+    },
+    {
+      "source": "/api/store/test/:testId",
+      "destination": "/static-store/test/:testId.json"
+    },
+    {
+      "source": "/api/store/pdf/:pdfId",
+      "destination": "/static-store/pdfs/:pdfId.pdf"
+    },
+    {
+      "source": "/((?!api/|static-store/|assets/).*)",
+      "destination": "/index.html"
+    }
+  ]
+}
