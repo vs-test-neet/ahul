@@ -42,6 +42,7 @@ import {
   parseCbtHtmlFile,
 } from '../utils/htmlTestParser';
 import { generateQuestionPaperPdfWithWatermark } from '../utils/questionPaperPdfGenerator';
+import { loadTestBundleFromFirestore } from '../firebase';
 import { HeartCelebrationCanvas } from './HeartCelebrationCanvas';
 
 interface CbtExamRunnerProps {
@@ -54,6 +55,7 @@ interface CbtExamRunnerProps {
   practiceMode?: boolean;
   rawHtmlContent?: string;
   initialHtmlMode?: boolean;
+  useServerHtmlStream?: boolean;
   initialReviewAttempt?: TestAttempt | null;
   testAttempts?: TestAttempt[];
   onSyncMistakesAndBookmarks?: (items: MistakeNotebookItem[], masteredUids?: string[]) => void;
@@ -184,6 +186,7 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
   practiceMode = false,
   rawHtmlContent = '',
   initialHtmlMode = false,
+  useServerHtmlStream = false,
   initialReviewAttempt = null,
   testAttempts = [],
   onSyncMistakesAndBookmarks,
@@ -285,8 +288,17 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     }
   }, [inProgressStorageKey, initialReviewAttempt]);
 
+  const [localFallbackHtml, setLocalFallbackHtml] = useState<string>('');
+  const [serverStreamFailed, setServerStreamFailed] = useState<boolean>(false);
+  const [serverStreamMountNonce] = useState<number>(() => Date.now());
+  const activeRawHtml = localFallbackHtml || rawHtmlContent;
+
   const [exactHtmlMode, setExactHtmlMode] = useState<boolean>(() =>
-    Boolean(!initialReviewAttempt && !practiceMode && (initialHtmlMode || Boolean(rawHtmlContent)))
+    Boolean(
+      !initialReviewAttempt &&
+        !practiceMode &&
+        (initialHtmlMode || useServerHtmlStream || Boolean(rawHtmlContent))
+    )
   );
   const [htmlBridgeReady, setHtmlBridgeReady] = useState<boolean>(false);
   const [showHtmlFallbackExit, setShowHtmlFallbackExit] = useState<boolean>(false);
@@ -394,9 +406,9 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     totalTimeSpent: number;
   } | null>(null);
 
-  // Pre-decode upcoming question images so switching questions has 0ms lag
+  // Pre-decode upcoming question images ONLY when native React CBT view is active (never waste RAM while HTML iframe is open)
   useEffect(() => {
-    if (isSubmitted) return;
+    if (isSubmitted || exactHtmlMode) return;
     const indicesToPreload = [currentIdx, currentIdx + 1, currentIdx + 2, currentIdx + 3];
     for (const i of indicesToPreload) {
       const q = questions[i];
@@ -419,7 +431,7 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
         }
       });
     }
-  }, [currentIdx, questions, isSubmitted]);
+  }, [currentIdx, questions, isSubmitted, exactHtmlMode]);
 
   // AI Weak Link Rescue Engine State
   const [rescuePlan, setRescuePlan] = useState<WeakLinkRescuePlan | null>(null);
@@ -1528,11 +1540,34 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
       try {
         const activeAns =
           Object.keys(answersRef.current || {}).length > 0 ? answersRef.current : answers;
+        let pdfQuestions = questions;
+        let pdfRawHtml = activeRawHtml;
+
+        // If test opened via zero-RAM /paper.html stream, fetch full bundle lazily ONLY at PDF download time
+        const needsFullBundleForPdf =
+          !pdfRawHtml &&
+          (!pdfQuestions.length ||
+            (!pdfQuestions[0]?.imageEn &&
+              !pdfQuestions[0]?.imageHi &&
+              (!pdfQuestions[0]?.questionEn || pdfQuestions[0].questionEn.length < 22)));
+        if (needsFullBundleForPdf && testMeta.id) {
+          setPdfProgressStep('Loading complete diagrams & solutions...');
+          try {
+            const fullBundle = await loadTestBundleFromFirestore(testMeta.id);
+            if (fullBundle.rawHtml) pdfRawHtml = fullBundle.rawHtml;
+            if (Array.isArray(fullBundle.questions) && fullBundle.questions.length > 0) {
+              pdfQuestions = fullBundle.questions;
+            }
+          } catch {
+            // proceed with available questions
+          }
+        }
+
         await generateQuestionPaperPdfWithWatermark(
           {
             testMeta,
-            questions,
-            rawHtmlContent,
+            questions: pdfQuestions,
+            rawHtmlContent: pdfRawHtml,
             answers: activeAns,
             stats: activeSt,
             studentName: studentName || 'NEET Aspirant',
@@ -1563,7 +1598,7 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
       answers,
       testMeta,
       questions,
-      rawHtmlContent,
+      activeRawHtml,
       studentName,
       studentBatch,
     ]
@@ -1768,34 +1803,84 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     );
   };
 
-  // Build full-screen native HTML test document:
-  // ALWAYS render the exact uploaded HTML file (`rawHtmlContent`) whenever present so 100% of HTML tests open with their exact original UI & questions.
-  // Memoized strictly on `[exactHtmlMode, isSubmitted, rawHtmlContent, testMeta.id]` so `setAnswers()` on submit or SSE updates NEVER reload the iframe!
+  // Primary zero-RAM streaming URL when server hosts the test HTML cleanly (eliminates 12MB+ Blob/state duplication)
+  const serverHtmlPaperUrl = useMemo(() => {
+    if (!exactHtmlMode || isSubmitted || !useServerHtmlStream || serverStreamFailed || activeRawHtml.trim().length > 20) {
+      return '';
+    }
+    if (!testMeta.id) return '';
+    return `/api/store/test/${encodeURIComponent(testMeta.id)}/paper.html?v=${serverStreamMountNonce}`;
+  }, [exactHtmlMode, isSubmitted, useServerHtmlStream, serverStreamFailed, activeRawHtml, testMeta.id, serverStreamMountNonce]);
+
+  const triggerLocalHtmlFallback = useCallback(async () => {
+    setServerStreamFailed(true);
+    try {
+      const bundle = await loadTestBundleFromFirestore(testMeta.id);
+      if (bundle.rawHtml && bundle.rawHtml.trim().length > 20) {
+        setLocalFallbackHtml(bundle.rawHtml);
+        return;
+      }
+    } catch {
+      // ignore
+    }
+    setExactHtmlMode(false);
+  }, [testMeta.id]);
+
+  // Build full-screen native HTML test document ONLY when not streaming directly from server /paper.html
+  // Handles ANY partial, legacy, or full HTML structure safely without blocking alert/open or stale storage.
   const effectiveHtmlDoc = useMemo(() => {
-    if (!exactHtmlMode || isSubmitted) return '';
-    const trimmedRaw = (rawHtmlContent || '').trim();
+    if (!exactHtmlMode || isSubmitted || serverHtmlPaperUrl) return '';
+    const trimmedRaw = (activeRawHtml || '').trim();
 
     const sourceHtml =
       trimmedRaw.length > 20
         ? trimmedRaw
         : buildStandaloneCbtHtmlFromQuestions(testMeta, questions);
 
-    // Strip trailing Cloudflare challenge script only in the tail slice so 12.6MB HTML strings aren't full-scanned
-    const tailOffset = Math.max(0, sourceHtml.length - 4096);
-    const rawBaseHtml =
-      sourceHtml.slice(0, tailOffset) +
-      sourceHtml
-        .slice(tailOffset)
-        .replace(
-          /<script>\(function\(\)\{function c\(\)\{var b=a\.contentDocument[\s\S]*?<\/script>/gi,
-          ''
-        );
+    // Strip trailing Cloudflare challenge/beacon scripts cleanly without scanning 12MB middle segments
+    const tailOffset = Math.max(0, sourceHtml.length - 8192);
+    const cleanedTail = sourceHtml
+      .slice(tailOffset)
+      .replace(
+        /<script>\(function\(\)\{function c\(\)\{var b=a\.contentDocument[\s\S]*?<\/script>/gi,
+        ''
+      )
+      .replace(/<script[^>]*beacon\.min\.js[^>]*>[\s\S]*?<\/script>/gi, '');
 
-    // Pre-execution head script: isolates generic localStorage keys per testId AND clears any stale
-    // `submitted: true` / `remainingSec <= 60` / expired `cbt_start` so uploaded HTML tests NEVER get stuck or refuse to run!
+    let baseHtml = (sourceHtml.slice(0, tailOffset) + cleanedTail)
+      .replace(/<meta[^>]+http-equiv=["']?Content-Security-Policy["']?[^>]*>/gi, '')
+      .replace(/<script[^>]+cdn-cgi[^>]*>[\s\S]*?<\/script>/gi, '');
+
+    // Wrap partial HTML snippets/fragments that lack <head> or <body> so arbitrary HTML opens reliably
+    if (!/<body[\s>]/i.test(baseHtml)) {
+      const safeTitleEsc = String(testMeta.title || 'VS Test').replace(/</g, '&lt;');
+      baseHtml = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>${safeTitleEsc}</title></head><body>${baseHtml}</body></html>`;
+    } else if (!/<head[\s>]/i.test(baseHtml)) {
+      const htmlMatch = /<html[^>]*>/i.exec(baseHtml);
+      if (htmlMatch && typeof htmlMatch.index === 'number') {
+        const pos = htmlMatch.index + htmlMatch[0].length;
+        baseHtml = `${baseHtml.slice(0, pos)}<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"></head>${baseHtml.slice(pos)}`;
+      } else {
+        baseHtml = `<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"></head>${baseHtml}`;
+      }
+    }
+
+    // Pre-execution head script: non-blocking iframe polyfills, error suppression, and localStorage testId isolation
     const preBootSanitizerScript = `<script>
 (function(){
   try {
+    try { window.alert = function(){}; } catch(e) {}
+    try { window.confirm = function(){ return true; }; } catch(e) {}
+    try { window.open = function(){ return null; }; } catch(e) {}
+    window.addEventListener('error', function(ev) {
+      if (ev && ev.message && (ev.message.indexOf('Script error') !== -1 || ev.message.indexOf('ResizeObserver') !== -1)) {
+        ev.preventDefault();
+      }
+    });
+    window.addEventListener('unhandledrejection', function(ev) {
+      try { ev.preventDefault(); } catch(e) {}
+    });
+
     var TEST_ISO_ID = ${JSON.stringify(testMeta.id || 'default_test')};
     var GENERIC_CBT_KEYS = {
       cbt_answers: 1,
@@ -1812,16 +1897,22 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
 
     // Namespace generic keys like cbt_start / cbt_submitted per testId so different tests never collide
     Storage.prototype.getItem = function(k) {
-      var mapped = (this === window.localStorage && GENERIC_CBT_KEYS[k]) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
-      return origGetItem.call(this, mapped);
+      try {
+        var mapped = (this === window.localStorage && GENERIC_CBT_KEYS[k]) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
+        return origGetItem.call(this, mapped);
+      } catch(e) { return null; }
     };
     Storage.prototype.setItem = function(k, v) {
-      var mapped = (this === window.localStorage && GENERIC_CBT_KEYS[k]) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
-      return origSetItem.call(this, mapped, v);
+      try {
+        var mapped = (this === window.localStorage && GENERIC_CBT_KEYS[k]) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
+        return origSetItem.call(this, mapped, v);
+      } catch(e) {}
     };
     Storage.prototype.removeItem = function(k) {
-      var mapped = (this === window.localStorage && GENERIC_CBT_KEYS[k]) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
-      return origRemoveItem.call(this, mapped);
+      try {
+        var mapped = (this === window.localStorage && GENERIC_CBT_KEYS[k]) ? ('vs_iso_' + TEST_ISO_ID + '_' + k) : k;
+        return origRemoveItem.call(this, mapped);
+      } catch(e) {}
     };
 
     // Reset any previously submitted or expired timer state in localStorage so opening a test ALWAYS starts runnable
@@ -1858,7 +1949,7 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
 
     // Hook into modern uploaded HTML tests (`computeResults(...)` inside `renderAnalysisDashboard` AND `buildAnalysis()` in AIATS)
     // so wrong answers, bookmarked questions, and final scores are 100% captured even inside IIFE closures!
-    let baseHtml = rawBaseHtml
+    baseHtml = baseHtml
       .replace(
         /const\s+res\s*=\s*computeResults\s*\(([^)]*)\)\s*;/g,
         'const res = computeResults($1); try { if (typeof window.__vsOnHtmlAnalysisResult === "function") window.__vsOnHtmlAnalysisResult(res); } catch(e) {}'
@@ -2223,7 +2314,7 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     }
     return `${baseHtml}${bridgeScript}`;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [exactHtmlMode, isSubmitted, rawHtmlContent, testMeta.id]);
+  }, [exactHtmlMode, isSubmitted, serverHtmlPaperUrl, activeRawHtml, testMeta.id]);
 
   // Create a fast same-origin Blob URL for large HTML papers so 12.6MB strings never choke iframe srcDoc
   const htmlBlobUrl = useMemo(() => {
@@ -2375,9 +2466,9 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     setShowHtmlFallbackExit(false);
     const timer = window.setTimeout(() => {
       setShowHtmlFallbackExit(true);
-    }, 700);
+    }, 900);
     return () => window.clearTimeout(timer);
-  }, [exactHtmlMode, isSubmitted, rawHtmlContent]);
+  }, [exactHtmlMode, isSubmitted, activeRawHtml, serverHtmlPaperUrl]);
 
   useEffect(() => {
     if (!exactHtmlMode) return;
@@ -2387,6 +2478,8 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
       if (data.type === 'VS_CBT_HTML_BRIDGE_READY') {
         setHtmlBridgeReady(true);
         setShowHtmlFallbackExit(false);
+      } else if (data.type === 'VS_CBT_HTML_NOT_FOUND') {
+        void triggerLocalHtmlFallback();
       } else if (data.type === 'VS_CBT_HTML_EXIT') {
         persistInProgressSnapshot();
         onExit();
@@ -2530,6 +2623,7 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     syncExtractedHtmlMistakes,
     handleShareResult,
     handleDownloadQuestionPaperPdf,
+    triggerLocalHtmlFallback,
     htmlResultOverride,
     persistInProgressSnapshot,
     normalizeOptCode,
@@ -2545,22 +2639,33 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
     testMeta.title,
   ]);
 
-  if (exactHtmlMode && !isSubmitted && effectiveHtmlDoc) {
+  if (exactHtmlMode && !isSubmitted && (serverHtmlPaperUrl || effectiveHtmlDoc)) {
+    const activeIframeSrc = serverHtmlPaperUrl || htmlBlobUrl || undefined;
+    const activeIframeSrcDoc = activeIframeSrc ? undefined : effectiveHtmlDoc;
     return (
       <div className="fixed inset-0 z-50 w-full h-dvh flex flex-col bg-[#effaff] overflow-hidden">
         {renderShareScorecardModal()}
         {renderPdfGeneratingOverlay()}
         {!htmlBridgeReady && showHtmlFallbackExit && (
-          <button
-            type="button"
-            onClick={() => {
-              persistInProgressSnapshot();
-              onExit();
-            }}
-            className="fixed top-2.5 left-2.5 z-[60] px-3 py-1.5 rounded-xl bg-white/95 hover:bg-white text-sky-900 border border-sky-300 shadow-lg text-xs font-extrabold cursor-pointer"
-          >
-            ← Back to Home
-          </button>
+          <div className="fixed top-2.5 left-2.5 right-2.5 z-[60] flex items-center justify-between gap-2 pointer-events-none">
+            <button
+              type="button"
+              onClick={() => {
+                persistInProgressSnapshot();
+                onExit();
+              }}
+              className="pointer-events-auto px-3 py-1.5 rounded-xl bg-white/95 hover:bg-white text-sky-900 border border-sky-300 shadow-lg text-xs font-extrabold cursor-pointer"
+            >
+              ← Back to Home
+            </button>
+            <button
+              type="button"
+              onClick={() => setExactHtmlMode(false)}
+              className="pointer-events-auto px-3 py-1.5 rounded-xl bg-sky-600/95 hover:bg-sky-700 text-white border border-sky-400 shadow-lg text-xs font-extrabold cursor-pointer"
+            >
+              Native CBT View
+            </button>
+          </div>
         )}
         {htmlResultOverride && (
           <div className="fixed bottom-4 right-4 z-[65] flex flex-wrap items-center gap-2">
@@ -2589,8 +2694,13 @@ export const CbtExamRunner: React.FC<CbtExamRunnerProps> = ({
           </div>
         )}
         <iframe
-          src={htmlBlobUrl || undefined}
-          srcDoc={htmlBlobUrl ? undefined : effectiveHtmlDoc}
+          src={activeIframeSrc}
+          srcDoc={activeIframeSrcDoc}
+          onError={() => {
+            if (serverHtmlPaperUrl) {
+              void triggerLocalHtmlFallback();
+            }
+          }}
           title={testMeta.title}
           className="w-full flex-1 h-full border-0 bg-white"
         />

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'vs-test-app-v4';
+const CACHE_NAME = 'vs-test-app-v5';
 const PRECACHE_URLS = [
   '/',
   '/index.html',
@@ -43,7 +43,8 @@ self.addEventListener('fetch', (event) => {
     url.pathname.startsWith('/api/') ||
     url.pathname.startsWith('/src/') ||
     url.pathname.startsWith('/node_modules/') ||
-    url.pathname.startsWith('/@')
+    url.pathname.startsWith('/@') ||
+    url.pathname.endsWith('/paper.html')
   ) {
     return;
   }

@@ -31,16 +31,31 @@
   <body>
     <script>
       window.addEventListener('unhandledrejection', function (event) {
-        var msg = event && event.reason && (event.reason.message || String(event.reason));
-        if (typeof msg === 'string' && msg.indexOf('WebSocket closed without opened') !== -1) {
-          event.preventDefault();
-        }
+        try {
+          var reason = event && event.reason;
+          var name = reason && reason.name ? String(reason.name) : '';
+          var msg = reason && reason.message ? String(reason.message) : String(reason || '');
+          if (
+            msg.indexOf('WebSocket closed without opened') !== -1 ||
+            msg.indexOf('QuotaExceededError') !== -1 ||
+            name === 'AbortError' ||
+            name === 'QuotaExceededError'
+          ) {
+            event.preventDefault();
+          }
+        } catch (e) {}
       });
       window.addEventListener('error', function (event) {
-        var msg = event && (event.message || (event.error && event.error.message));
-        if (typeof msg === 'string' && msg.indexOf('WebSocket closed without opened') !== -1) {
-          event.preventDefault();
-        }
+        try {
+          var msg = event && (event.message || (event.error && event.error.message)) || '';
+          if (
+            typeof msg === 'string' &&
+            (msg.indexOf('WebSocket closed without opened') !== -1 ||
+              msg.indexOf('ResizeObserver loop') !== -1)
+          ) {
+            event.preventDefault();
+          }
+        } catch (e) {}
       });
     </script>
     <div id="root"></div>

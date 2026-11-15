@@ -1339,6 +1339,68 @@ export async function loadTestHtmlFromFirestore(testId: string): Promise<string>
 }
 
 /**
+ * Ultra-lightweight (<300KB) launch loader for HTML test mode:
+ * Streams the full multi-MB HTML paper directly inside the sandboxed <iframe> via `/api/store/test/:id/paper.html`
+ * instead of cloning 12.6MB strings across fetch JSON, React state, IndexedDB, and Blob URLs (preventing mobile OOM crashes!).
+ * Falls back cleanly to local IndexedDB Vault / localStorage when offline.
+ */
+export async function loadTestFastForLaunch(
+  testId: string
+): Promise<{ questions: CbtQuestion[]; rawHtml: string; useServerHtmlStream: boolean }> {
+  const safeId = testId.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 100);
+
+  // 1. If already cached in RAM, reuse immediately
+  const cachedRam = ramTestBundleCache.get(safeId);
+  if (
+    cachedRam &&
+    (cachedRam.rawHtml.trim().length > 20 || areQuestionsPlayable(cachedRam.questions))
+  ) {
+    return {
+      questions: cachedRam.questions,
+      rawHtml: cachedRam.rawHtml,
+      useServerHtmlStream: false,
+    };
+  }
+
+  // 2. Fast metadata+questions query (?skipHtml=1) to verify server availability without downloading 12MB+ rawHtml JSON
+  try {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 15000);
+    const res = await fetch(`/api/store/test/${encodeURIComponent(safeId)}?skipHtml=1`, {
+      cache: 'no-store',
+      signal: controller.signal,
+    });
+    window.clearTimeout(timer);
+    if (res.ok) {
+      const payload = (await res.json()) as {
+        hasRawHtml?: boolean;
+        questions?: unknown[];
+      };
+      const serverQs = Array.isArray(payload.questions)
+        ? payload.questions.map((item, idx) => normalizeCbtQuestion(item, idx))
+        : [];
+      if (payload.hasRawHtml || serverQs.length > 0) {
+        return {
+          questions: serverQs,
+          rawHtml: '',
+          useServerHtmlStream: true,
+        };
+      }
+    }
+  } catch {
+    // Offline or network glitch -> fall through to IndexedDB Vault
+  }
+
+  // 3. Offline / local-only fallback via full bundle loader
+  const fallbackBundle = await loadTestBundleFromFirestore(testId);
+  return {
+    questions: fallbackBundle.questions,
+    rawHtml: fallbackBundle.rawHtml,
+    useServerHtmlStream: false,
+  };
+}
+
+/**
  * Explicitly delete a test when Admin clicks Delete Test (ONLY way a test is ever deleted).
  */
 export async function deleteTestFromFirestore(testId: string): Promise<void> {

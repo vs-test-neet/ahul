@@ -49,6 +49,7 @@ import {
   loadTestBundleFromFirestore,
   loadTestQuestionsFromFirestore,
   loadTestHtmlFromFirestore,
+  loadTestFastForLaunch,
   deleteTestFromFirestore,
   saveFolderToFirestore,
   deleteFolderFromFirestore,
@@ -135,6 +136,29 @@ function sanitizeInput(val: string, maxLen = 140): string {
     .replace(/[<>]/g, '')
     .trim()
     .slice(0, maxLen);
+}
+
+/**
+ * Quota-safe localStorage writer: prevents mobile QuotaExceededError from crashing React renders or callbacks
+ */
+function safeLocalStorageSet(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    try {
+      const toRemove: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && (k.startsWith('vs_neet_html_') || k.startsWith('vs_neet_q_') || k.startsWith('vs_iso_'))) {
+          toRemove.push(k);
+        }
+      }
+      for (const k of toRemove) localStorage.removeItem(k);
+      localStorage.setItem(key, value);
+    } catch {
+      // ignore remaining quota constraints
+    }
+  }
 }
 
 /**
@@ -458,98 +482,105 @@ const Neet2027Countdown = React.memo(function Neet2027Countdown({
             </div>
           </div>
 
-          {/* Right Side: Medium-Sized Animated Benzene Ring Containing ONLY DAYS (No Formula, No Name) */}
-          <div className="relative w-28 h-28 sm:w-32 sm:h-32 flex items-center justify-center shrink-0 select-none">
-            <svg
-              viewBox="0 0 200 200"
-              className="w-full h-full overflow-visible select-none"
-              aria-hidden="true"
-            >
-              {/* Soft Ambient Glow behind the Ring */}
-              <circle
-                cx="100"
-                cy="100"
-                r="76"
-                fill={isDarkMode ? 'rgba(251, 191, 36, 0.09)' : 'rgba(251, 191, 36, 0.16)'}
-              />
-
-              {/* Animated Moving Hexagonal Ring Structure */}
-              <g className="benzene-molecule-motion">
-                {/* Rotating Inner Resonance Circle */}
-                <g className="benzene-resonance-orbit">
-                  <circle
-                    cx="100"
-                    cy="100"
-                    r="54"
-                    fill="none"
-                    stroke="#f59e0b"
-                    strokeWidth="1.5"
-                    strokeDasharray="7 6"
-                    opacity="0.55"
-                  />
-                </g>
-
-                {/* Outer 6-Sided Hexagon */}
-                <polygon
-                  points={outerHexPoints}
-                  fill={isDarkMode ? '#0b1120' : '#ffffff'}
-                  stroke={isDarkMode ? '#475569' : '#0f172a'}
-                  strokeWidth="4.5"
-                  strokeLinejoin="round"
+          {/* Right Side: Medium-Sized Animated Benzene Ring Containing ONLY DAYS + Highlighted Weekly Update Note Below */}
+          <div className="flex flex-col items-center shrink-0">
+            <div className="relative w-28 h-28 sm:w-32 sm:h-32 flex items-center justify-center shrink-0 select-none">
+              <svg
+                viewBox="0 0 200 200"
+                className="w-full h-full overflow-visible select-none"
+                aria-hidden="true"
+              >
+                {/* Soft Ambient Glow behind the Ring */}
+                <circle
+                  cx="100"
+                  cy="100"
+                  r="76"
+                  fill={isDarkMode ? 'rgba(251, 191, 36, 0.09)' : 'rgba(251, 191, 36, 0.16)'}
                 />
 
-                {/* 3 Alternating Colored Internal Pi Bonds */}
-                {activePiBonds.map((bond, bIdx) => (
-                  <g
-                    key={`pi-${bIdx}`}
-                    className="pi-bond-glow"
-                    style={{ color: bond.color, transition: 'all 0.45s ease' }}
-                  >
-                    <line
-                      x1={bond.x1}
-                      y1={bond.y1}
-                      x2={bond.x2}
-                      y2={bond.y2}
-                      stroke={bond.color}
-                      strokeWidth="8"
-                      strokeLinecap="round"
-                      opacity="0.28"
-                    />
-                    <line
-                      x1={bond.x1}
-                      y1={bond.y1}
-                      x2={bond.x2}
-                      y2={bond.y2}
-                      stroke={bond.color}
-                      strokeWidth="4"
-                      strokeLinecap="round"
+                {/* Animated Moving Hexagonal Ring Structure */}
+                <g className="benzene-molecule-motion">
+                  {/* Rotating Inner Resonance Circle */}
+                  <g className="benzene-resonance-orbit">
+                    <circle
+                      cx="100"
+                      cy="100"
+                      r="54"
+                      fill="none"
+                      stroke="#f59e0b"
+                      strokeWidth="1.5"
+                      strokeDasharray="7 6"
+                      opacity="0.55"
                     />
                   </g>
-                ))}
 
-                {/* Clean Corner Nodes (No Letters or Formulas) */}
-                {vertices.map((v, vIdx) => (
-                  <circle
-                    key={`v-${vIdx}`}
-                    cx={v.cx}
-                    cy={v.cy}
-                    r="3.5"
-                    fill={isDarkMode ? '#f8fafc' : '#0f172a'}
-                    stroke="#38bdf8"
-                    strokeWidth="1.5"
+                  {/* Outer 6-Sided Hexagon */}
+                  <polygon
+                    points={outerHexPoints}
+                    fill={isDarkMode ? '#0b1120' : '#ffffff'}
+                    stroke={isDarkMode ? '#475569' : '#0f172a'}
+                    strokeWidth="4.5"
+                    strokeLinejoin="round"
                   />
-                ))}
-              </g>
-            </svg>
 
-            {/* ONLY DAYS Inside the Benzene Ring */}
-            <div className="absolute inset-0 flex flex-col items-center justify-center text-center pointer-events-none">
-              <div className="text-2xl sm:text-3xl font-black font-mono-tabular text-black dark:text-white tracking-tight leading-none">
-                {days}
+                  {/* 3 Alternating Colored Internal Pi Bonds */}
+                  {activePiBonds.map((bond, bIdx) => (
+                    <g
+                      key={`pi-${bIdx}`}
+                      className="pi-bond-glow"
+                      style={{ color: bond.color, transition: 'all 0.45s ease' }}
+                    >
+                      <line
+                        x1={bond.x1}
+                        y1={bond.y1}
+                        x2={bond.x2}
+                        y2={bond.y2}
+                        stroke={bond.color}
+                        strokeWidth="8"
+                        strokeLinecap="round"
+                        opacity="0.28"
+                      />
+                      <line
+                        x1={bond.x1}
+                        y1={bond.y1}
+                        x2={bond.x2}
+                        y2={bond.y2}
+                        stroke={bond.color}
+                        strokeWidth="4"
+                        strokeLinecap="round"
+                      />
+                    </g>
+                  ))}
+
+                  {/* Clean Corner Nodes (No Letters or Formulas) */}
+                  {vertices.map((v, vIdx) => (
+                    <circle
+                      key={`v-${vIdx}`}
+                      cx={v.cx}
+                      cy={v.cy}
+                      r="3.5"
+                      fill={isDarkMode ? '#f8fafc' : '#0f172a'}
+                      stroke="#38bdf8"
+                      strokeWidth="1.5"
+                    />
+                  ))}
+                </g>
+              </svg>
+
+              {/* ONLY DAYS Inside the Benzene Ring */}
+              <div className="absolute inset-0 flex flex-col items-center justify-center text-center pointer-events-none">
+                <div className="text-2xl sm:text-3xl font-black font-mono-tabular text-black dark:text-white tracking-tight leading-none">
+                  {days}
+                </div>
+                <div className="text-[10px] font-extrabold uppercase tracking-widest text-amber-600 dark:text-amber-400 mt-1">
+                  DAYS
+                </div>
               </div>
-              <div className="text-[10px] font-extrabold uppercase tracking-widest text-amber-600 dark:text-amber-400 mt-1">
-                DAYS
-              </div>
+            </div>
+
+            {/* Subtle Highlighted Notice Below Day Count */}
+            <div className="mt-1 px-2.5 py-1 rounded-lg bg-amber-500/15 dark:bg-amber-400/15 border border-amber-400/50 text-amber-800 dark:text-amber-200 text-[10px] sm:text-[11px] font-extrabold tracking-tight text-center shadow-xs whitespace-nowrap">
+              Every Saturday All Tests updated
             </div>
           </div>
         </div>
@@ -886,6 +917,7 @@ function AppContent() {
     practiceMode: boolean;
     rawHtmlContent?: string;
     initialHtmlMode?: boolean;
+    useServerHtmlStream?: boolean;
     reviewAttempt?: TestAttempt | null;
   } | null>(null);
   const [isLoadingTestQuestions, setIsLoadingTestQuestions] = useState(false);
@@ -1228,7 +1260,7 @@ function AppContent() {
           lastLoginAt: Date.now(),
         };
         setCurrentStudent(googleStudent);
-        localStorage.setItem('neet_cbt_student_session', JSON.stringify(googleStudent));
+        safeLocalStorageSet('neet_cbt_student_session', JSON.stringify(googleStudent));
         saveStudentToFirestore(googleStudent, !existing).catch(() => {});
       }
     });
@@ -1400,7 +1432,7 @@ function AppContent() {
 
     const hasSeededFolders = localStorage.getItem('neet_cbt_folders_seeded_v2');
     if (!hasSeededFolders && boot.folders.length === 0 && combinedDeletedFolderIds.length === 0) {
-      localStorage.setItem('neet_cbt_folders_seeded_v2', 'true');
+      safeLocalStorageSet('neet_cbt_folders_seeded_v2', 'true');
       for (const seedFolder of DEFAULT_SEED_FOLDERS) {
         await saveFolderToFirestore(seedFolder);
       }
@@ -1408,7 +1440,7 @@ function AppContent() {
 
     const hasSeededTests = localStorage.getItem('neet_cbt_seeded_v4');
     if (!hasSeededTests && reconciledTests.length === 0 && combinedDeletedIds.length === 0) {
-      localStorage.setItem('neet_cbt_seeded_v4', 'true');
+      safeLocalStorageSet('neet_cbt_seeded_v4', 'true');
       for (const seedTest of DEFAULT_SEED_TESTS) {
         if (!deletedSet.has(seedTest.id)) {
           await saveTestToFirestore(seedTest, undefined, undefined, { explicitAdminCreate: true });
@@ -1814,7 +1846,7 @@ function AppContent() {
         ...match,
       };
       setCurrentStudent(merged);
-      localStorage.setItem('neet_cbt_student_session', JSON.stringify(merged));
+      safeLocalStorageSet('neet_cbt_student_session', JSON.stringify(merged));
     }
   }, [students]);
 
@@ -2033,7 +2065,7 @@ function AppContent() {
     }
 
     setCurrentStudent(student);
-    localStorage.setItem('neet_cbt_student_session', JSON.stringify(student));
+    safeLocalStorageSet('neet_cbt_student_session', JSON.stringify(student));
     setShowStudentAuthModal(false);
     showToast(welcomeMsg, 'success');
 
@@ -2524,7 +2556,7 @@ function AppContent() {
     }
   }, []);
 
-  // Increment playCount and launch the Exam Runner in single-request instant HTML Mode (or Practice Mode)
+  // Increment playCount and launch the Exam Runner via zero-RAM direct HTML stream (or Practice Mode)
   const handleStartExamNow = async (
     test: CbtTestMeta,
     modeOverride?: 'html' | 'practice'
@@ -2536,7 +2568,11 @@ function AppContent() {
     }
     setIsLoadingTestQuestions(true);
     try {
-      let rawHtml = localRawHtmlCache[test.id] || '';
+      const launchMode = modeOverride || selectedExamLaunchMode;
+      const preferHtml = launchMode !== 'practice';
+
+      let rawHtml = '';
+      let useServerHtmlStream = false;
       let qs = localQuestionsCache[test.id] || [];
       const hasPlayableCachedQs =
         qs.length > 0 &&
@@ -2551,35 +2587,64 @@ function AppContent() {
               ))
         );
 
-      if (test.id === 'prayas_06' || test.assetUrl) {
-        if (!rawHtml || qs.length === 0) {
-          const [bHtml, bQs] = await Promise.all([
-            rawHtml ? Promise.resolve(rawHtml) : loadBuiltInPrayas06Html(),
-            qs.length > 0 ? Promise.resolve(qs) : loadBuiltInPrayas06Questions(),
-          ]);
-          rawHtml = bHtml;
-          qs = bQs;
+      if (preferHtml) {
+        if (test.id === 'prayas_06' || (test.assetUrl && test.assetUrl.startsWith('/assets/'))) {
+          useServerHtmlStream = true;
+          if (!qs.length) {
+            qs = createCleanCompanionSlots(test);
+          }
+        } else if (localRawHtmlCache[test.id]) {
+          rawHtml = localRawHtmlCache[test.id];
+          if (!hasPlayableCachedQs && rawHtml) {
+            const parsed = parseCbtHtmlFile(rawHtml, test.title);
+            if (parsed && Array.isArray(parsed.questions) && parsed.questions.length > 0) {
+              qs = parsed.questions;
+            }
+          }
+        } else {
+          // Zero-RAM fast launch: checks metadata without downloading 12MB+ HTML blob into parent React tab
+          const fastLaunch = await loadTestFastForLaunch(test.id);
+          useServerHtmlStream = fastLaunch.useServerHtmlStream;
+          if (!useServerHtmlStream && fastLaunch.rawHtml) {
+            rawHtml = fastLaunch.rawHtml;
+          }
+          if (fastLaunch.questions.length > 0) {
+            qs = fastLaunch.questions;
+          }
         }
-      } else if (!rawHtml || !hasPlayableCachedQs) {
-        // Single fast bundle load from RAM / IndexedDB Vault (~5ms) / Server Store
-        const bundle = await loadTestBundleFromFirestore(test.id);
-        if (bundle.rawHtml) rawHtml = bundle.rawHtml;
-        if (bundle.questions.length > 0) qs = bundle.questions;
+      } else {
+        rawHtml = localRawHtmlCache[test.id] || '';
+        if (test.id === 'prayas_06' || test.assetUrl) {
+          if (!rawHtml || !hasPlayableCachedQs) {
+            const [bHtml, bQs] = await Promise.all([
+              rawHtml ? Promise.resolve(rawHtml) : loadBuiltInPrayas06Html(),
+              hasPlayableCachedQs ? Promise.resolve(qs) : loadBuiltInPrayas06Questions(),
+            ]);
+            rawHtml = bHtml;
+            qs = bQs;
+          }
+        } else if (!hasPlayableCachedQs) {
+          const bundle = await loadTestBundleFromFirestore(test.id);
+          if (bundle.rawHtml) rawHtml = bundle.rawHtml;
+          if (bundle.questions.length > 0) qs = bundle.questions;
+        }
+        if (qs.length === 0 && rawHtml) {
+          const parsed = parseCbtHtmlFile(rawHtml, test.title);
+          if (parsed && Array.isArray(parsed.questions) && parsed.questions.length > 0) {
+            qs = parsed.questions;
+          }
+        }
       }
 
-      if (rawHtml) {
-        // Keep only the active test's rawHtml in React state so mobile RAM is never exhausted
-        setLocalRawHtmlCache({ [test.id]: rawHtml });
-      }
-      if (qs.length === 0 && rawHtml) {
-        const parsed = parseCbtHtmlFile(rawHtml, test.title);
-        qs =
-          parsed && Array.isArray(parsed.questions) && parsed.questions.length > 0
-            ? parsed.questions
-            : createCleanCompanionSlots(test);
-      }
       if (qs.length === 0) {
         qs = createCleanCompanionSlots(test);
+      }
+
+      // Never keep multiple multi-MB question arrays or HTML blobs pinned in React state on mobile
+      if (!useServerHtmlStream && rawHtml) {
+        setLocalRawHtmlCache({ [test.id]: rawHtml });
+      } else {
+        setLocalRawHtmlCache({});
       }
       setLocalQuestionsCache({ ...BUILT_IN_COMPANION_QUESTIONS, [test.id]: qs });
 
@@ -2588,19 +2653,18 @@ function AppContent() {
       );
       incrementTestEngagement(test.id, 'playCount').catch(() => {});
 
-      const launchMode = modeOverride || selectedExamLaunchMode;
-
       setSelectedTestForInstructions(null);
       setActiveRunningTest({
         meta: test,
         questions: qs,
         practiceMode: launchMode === 'practice',
         rawHtmlContent: rawHtml,
-        initialHtmlMode: launchMode !== 'practice',
+        initialHtmlMode: preferHtml,
+        useServerHtmlStream,
         reviewAttempt: null,
       });
     } catch {
-      showToast('Failed to start exam.', 'error');
+      showToast('Failed to start exam. Please try again.', 'error');
     } finally {
       setIsLoadingTestQuestions(false);
     }
@@ -3367,6 +3431,7 @@ function AppContent() {
             practiceMode={activeRunningTest.practiceMode}
             rawHtmlContent={activeRunningTest.rawHtmlContent}
             initialHtmlMode={activeRunningTest.initialHtmlMode}
+            useServerHtmlStream={Boolean(activeRunningTest.useServerHtmlStream)}
             initialReviewAttempt={activeRunningTest.reviewAttempt}
             testAttempts={attempts}
             onSyncMistakesAndBookmarks={handleSyncMistakesAndBookmarks}
